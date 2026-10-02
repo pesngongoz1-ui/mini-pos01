@@ -1,6 +1,6 @@
 'use client'
 import { useState, useEffect } from 'react'
-import { supabase } from '@/lib/supabaseClient'
+import { supabase } from '../lib/supabaseClient'
 export default function ProductsPage() {
   const [products, setProducts] = useState([])
   const [form, setForm] = useState({ sku: '', name: '', price: '', stock: '', unit: 'ชิ้น' })
