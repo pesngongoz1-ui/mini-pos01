@@ -1,122 +1,216 @@
 'use client'
 
-import { useState } from 'react'
-import { supabase } from '@/lib/supabaseClient'
+import { useState, useEffect } from 'react'
+import { supabase } from '../../lib/supabaseClient'
 
 export default function SellPage() {
+  const [products, setProducts] = useState([])
+  const [selectedProductId, setSelectedProductId] = useState('')
+  const [quantity, setQuantity] = useState(1)
   const [loading, setLoading] = useState(false)
+  const [message, setMessage] = useState('')
 
-  // ==========================================
-  // Helper Function: ส่งข้อความแจ้งเตือนเข้า Telegram
-  // ==========================================
-  const sendTelegramMessage = async (messageText) => {
-    const botToken = process.env.NEXT_PUBLIC_TELEGRAM_BOT_TOKEN
-    const chatId = process.env.NEXT_PUBLIC_TELEGRAM_CHAT_ID
+  // โหลดรายการสินค้าจาก Supabase
+  useEffect(() => {
+    fetchProducts()
+  }, [])
 
-    // หากไม่มีการตั้งค่า Config ให้ข้ามการส่งทันทีโดยไม่ให้กระทบระบบขาย
-    if (!botToken || !chatId) {
-      console.warn('Telegram Config is missing in environment variables.')
+  const fetchProducts = async () => {
+    const { data, error } = await supabase.from('products').select('*')
+    if (error) {
+      console.error('Error fetching products:', error)
+    } else {
+      setProducts(data || [])
+    }
+  }
+
+  // -------------------------------------------------------------
+  // ฟังก์ชันสำหรับส่งข้อความแจ้งเตือนไปยัง Telegram
+  // -------------------------------------------------------------
+  const sendTelegramNotification = async (messageText) => {
+    const BOT_TOKEN = process.env.NEXT_PUBLIC_TELEGRAM_BOT_TOKEN
+    const CHAT_ID = process.env.NEXT_PUBLIC_TELEGRAM_CHAT_ID
+
+    if (!BOT_TOKEN || !CHAT_ID) {
+      console.warn('Telegram Config ไม่ครบถ้วน (ตรวจสอบ Environment Variables)')
       return
     }
 
     try {
-      await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+      const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+        },
         body: JSON.stringify({
-          chat_id: chatId,
+          chat_id: CHAT_ID,
           text: messageText,
           parse_mode: 'HTML',
         }),
       })
-    } catch (error) {
-      // ดักจับ Error ไว้เพื่อไม่ให้กระทบกระบวนการขายหลัก
-      console.error('Failed to send Telegram notification:', error)
+
+      const data = await response.json()
+      if (!data.ok) {
+        console.error('Telegram API Error:', data.description)
+      }
+    } catch (err) {
+      // ครอบ try-catch เพื่อไม่ให้กระทบต่อระบบขาย หากการส่ง Telegram มีปัญหา
+      console.error('Failed to send Telegram notification:', err)
     }
   }
 
-  // ==========================================
-  // Main Function: ชำระเงิน / ตัดสต็อกสินค้า
-  // ==========================================
-  const handleCheckout = async (product, quantity) => {
+  // -------------------------------------------------------------
+  // ฟังก์ชันตัดสต็อกและบันทึกการขาย
+  // -------------------------------------------------------------
+  const handleSell = async (e) => {
+    e.preventDefault()
     setLoading(true)
+    setMessage('')
 
     try {
-      // 1. ดึงข้อมูลสต็อกและราคาปัจจุบันจาก Supabase
-      const { data: currentProduct, error: fetchError } = await supabase
-        .from('products')
-        .select('id, name, price, stock')
-        .eq('id', product.id)
-        .single()
-
-      if (fetchError || !currentProduct) {
-        throw new Error('ไม่พบข้อมูลสินค้าในระบบ')
+      // 1. ค้นหาสินค้าที่เลือก
+      const product = products.find((p) => p.id.toString() === selectedProductId.toString())
+      if (!product) {
+        setMessage('❌ กรุณาเลือกสินค้า')
+        setLoading(false)
+        return
       }
 
-      if (currentProduct.stock < quantity) {
-        throw new Error(`สินค้าในสต็อกไม่พอ (คงเหลือ ${currentProduct.stock} ชิ้น)`)
+      const qtyToSell = parseInt(quantity, 10)
+      if (isNaN(qtyToSell) || qtyToSell <= 0) {
+        setMessage('❌ กรุณาระบุจำนวนที่ถูกต้อง')
+        setLoading(false)
+        return
       }
 
-      // 2. คำนวณสต็อกหลังตัด และ ราคารวม
-      const updatedStock = currentProduct.stock - quantity
-      const totalPrice = currentProduct.price * quantity
+      // ตรวจสอบว่าสต็อกพอขายหรือไม่
+      if (product.stock < qtyToSell) {
+        setMessage(`❌ สต็อกไม่พอ (คงเหลือ ${product.stock} ชิ้น)`)
+        setLoading(false)
+        return
+      }
 
-      // 3. อัปเดตสต็อกสินค้าใหม่ใน Supabase
+      const newStock = product.stock - qtyToSell
+      const totalPrice = product.price * qtyToSell
+
+      // 2. ตัดสต็อกสินค้าใน Supabase
       const { error: updateError } = await supabase
         .from('products')
-        .update({ stock: updatedStock })
+        .update({ stock: newStock })
         .eq('id', product.id)
 
-      if (updateError) throw updateError
+      if (updateError) {
+        throw updateError
+      }
 
-      // 4. บันทึกประวัติการขาย (ถ้ามีตาราง sales)
+      // 3. (Optional) บันทึกประวัติการขายลงตาราง sales/orders
       await supabase.from('sales').insert([
         {
           product_id: product.id,
-          quantity: quantity,
+          product_name: product.name,
+          quantity: qtyToSell,
           total_price: totalPrice,
+          created_at: new Date().toISOString(),
         },
       ])
 
-      // ==========================================
-      // 5. ระบบแจ้งเตือน Telegram (Async Background Tasks)
-      // ==========================================
-      
+      // 4. แจ้งเตือนขายสำเร็จในเว็บ
+      setMessage(`✅ ขายสำเร็จ! ${product.name} จำนวน ${qtyToSell} ชิ้น (ราคารวม ${totalPrice.toLocaleString()} บาท)`)
+
+      // อัปเดต state รายการสินค้าหน้าเว็บ
+      fetchProducts()
+      setSelectedProductId('')
+      setQuantity(1)
+
+      // ---------------------------------------------------------
+      // 5. ส่งการแจ้งเตือน Telegram (Async / Non-blocking)
+      // ---------------------------------------------------------
+      const currentTime = new Date().toLocaleString('th-TH', { timeZone: 'Asia/Bangkok' })
+
       // งานที่ 1: แจ้งเตือน Order เข้า (New Order Alert)
-      const orderMessage = 
-        `🛍️ <b>มีรายการขายใหม่!</b>\n` +
-        `- สินค้า: ${currentProduct.name}\n` +
-        `- จำนวน: ${quantity} ชิ้น\n` +
-        `- ราคารวม: ${totalPrice.toLocaleString()} บาท\n` +
-        `- สต็อกคงเหลือปัจจุบัน: ${updatedStock} ชิ้น\n` +
-        `- เวลา: ${new Date().toLocaleString('th-TH')}`
+      const newOrderMsg = `🛒 <b>มีรายการขายใหม่!</b>
+• สินค้า: <b>${product.name}</b>
+• จำนวน: <b>${qtyToSell}</b> ชิ้น
+• ราคารวม: <b>${totalPrice.toLocaleString()}</b> บาท
+• สต็อกคงเหลือปัจจุบัน: <b>${newStock}</b> ชิ้น
+• เวลา: ${currentTime}`
 
-      await sendTelegramMessage(orderMessage)
+      await sendTelegramNotification(newOrderMsg)
 
-      // งานที่ 2: แจ้งเตือน Stock เหลือน้อย (Low Stock Alert: Stock <= 5)
-      if (updatedStock <= 5) {
-        const lowStockMessage = 
-          `🚨 <b>[เตือนภัย] สต็อกสินค้าใกล้หมด!</b>\n` +
-          `- สินค้า: ${currentProduct.name}\n` +
-          `- คงเหลือเพียง: ${updatedStock} ชิ้น\n` +
-          `⚠️ กรุณาเติมสต็อกสินค้าด่วน!`
+      // งานที่ 2: แจ้งเตือน Stock เหลือน้อย (Low Stock Alert <= 5)
+      if (newStock <= 5) {
+        const lowStockMsg = `🚨 <b>[เตือนภัย] สต็อกสินค้าเหลือน้อย!</b>
+• สินค้า: <b>${product.name}</b>
+• คงเหลือเพียง: <b>${newStock}</b> ชิ้น
+⚠️ กรุณาเติมสต็อกสินค้าด่วน!`
 
-        await sendTelegramMessage(lowStockMessage)
+        await sendTelegramNotification(lowStockMsg)
       }
 
-      alert('ชำระเงินและตัดสต็อกสำเร็จเรียบร้อย!')
-
     } catch (err) {
-      alert(`เกิดข้อผิดพลาด: ${err.message}`)
+      console.error('Sale failed:', err)
+      setMessage('❌ เกิดข้อผิดพลาดในการตัดสต็อกสินค้า')
     } finally {
       setLoading(false)
     }
   }
 
   return (
-    <div style={{ padding: '20px' }}>
-      <h1>หน้าขายสินค้า (POS)</h1>
-      {/* ส่วน UI แสดงรายการสินค้า / ปุ่มกดขายสินค้า */}
+    <div style={{ maxWidth: '500px', margin: '40px auto', padding: '20px', fontFamily: 'sans-serif' }}>
+      <h1>🛒 ระบบขายสินค้า (POS)</h1>
+
+      {message && (
+        <div style={{ padding: '10px', marginBottom: '15px', borderRadius: '5px', backgroundColor: '#f0f0f0' }}>
+          {message}
+        </div>
+      )}
+
+      <form onSubmit={handleSell}>
+        <div style={{ marginBottom: '15px' }}>
+          <label style={{ display: 'block', marginBottom: '5px' }}>เลือกสินค้า:</label>
+          <select
+            value={selectedProductId}
+            onChange={(e) => setSelectedProductId(e.target.value)}
+            style={{ width: '100%', padding: '8px' }}
+            required
+          >
+            <option value="">-- เลือกสินค้า --</option>
+            {products.map((p) => (
+              <option key={p.id} value={p.id}>
+                {p.name} - {p.price} บาท (คงเหลือ: {p.stock} ชิ้น)
+              </option>
+            ))}
+          </select>
+        </div>
+
+        <div style={{ marginBottom: '15px' }}>
+          <label style={{ display: 'block', marginBottom: '5px' }}>จำนวนที่ขาย:</label>
+          <input
+            type="number"
+            min="1"
+            value={quantity}
+            onChange={(e) => setQuantity(e.target.value)}
+            style={{ width: '100%', padding: '8px' }}
+            required
+          />
+        </div>
+
+        <button
+          type="submit"
+          disabled={loading}
+          style={{
+            width: '100%',
+            padding: '10px',
+            backgroundColor: '#0070f3',
+            color: 'white',
+            border: 'none',
+            borderRadius: '5px',
+            cursor: 'pointer',
+          }}
+        >
+          {loading ? 'กำลังทำรายการ...' : 'ยืนยันการขาย'}
+        </button>
+      </form>
     </div>
   )
 }
