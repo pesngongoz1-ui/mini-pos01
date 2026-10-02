@@ -1,139 +1,122 @@
 'use client'
-import { useState, useEffect } from 'react'
-import { supabase } from '../../lib/supabaseClient'
+
+import { useState } from 'react'
+import { supabase } from '@/lib/supabaseClient'
 
 export default function SellPage() {
-  const [products, setProducts] = useState([])
-  const [selectedProductId, setSelectedProductId] = useState('')
-  const [quantity, setQuantity] = useState(1)
-  const [cart, setCart] = useState([])
+  const [loading, setLoading] = useState(false)
 
-  useEffect(() => {
-    fetchProducts()
-  }, [])
+  // ==========================================
+  // Helper Function: ส่งข้อความแจ้งเตือนเข้า Telegram
+  // ==========================================
+  const sendTelegramMessage = async (messageText) => {
+    const botToken = process.env.NEXT_PUBLIC_TELEGRAM_BOT_TOKEN
+    const chatId = process.env.NEXT_PUBLIC_TELEGRAM_CHAT_ID
 
-  async function fetchProducts() {
-    const { data } = await supabase.from('products').select('*').order('name')
-    setProducts(data || [])
-  }
-
-  function addToCart() {
-    if (!selectedProductId) return
-    const product = products.find(p => p.id === selectedProductId)
-    if (!product) return
-
-    const existing = cart.find(item => item.id === product.id)
-    const currentQtyInCart = existing ? existing.qty : 0
-    const newQty = currentQtyInCart + Number(quantity)
-
-    if (newQty > product.stock) {
-      alert(`สต๊อกไม่พอ! มีสินค้าเหลือเพียง ${product.stock} ${product.unit}`)
+    // หากไม่มีการตั้งค่า Config ให้ข้ามการส่งทันทีโดยไม่ให้กระทบระบบขาย
+    if (!botToken || !chatId) {
+      console.warn('Telegram Config is missing in environment variables.')
       return
     }
 
-    if (existing) {
-      setCart(cart.map(item => item.id === product.id ? { ...item, qty: newQty } : item))
-    } else {
-      setCart([...cart, { ...product, qty: Number(quantity) }])
+    try {
+      await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: chatId,
+          text: messageText,
+          parse_mode: 'HTML',
+        }),
+      })
+    } catch (error) {
+      // ดักจับ Error ไว้เพื่อไม่ให้กระทบกระบวนการขายหลัก
+      console.error('Failed to send Telegram notification:', error)
     }
-    setQuantity(1)
   }
 
-  function removeFromCart(id) {
-    setCart(cart.filter(item => item.id !== id))
-  }
+  // ==========================================
+  // Main Function: ชำระเงิน / ตัดสต็อกสินค้า
+  // ==========================================
+  const handleCheckout = async (product, quantity) => {
+    setLoading(true)
 
-  const grandTotal = cart.reduce((sum, item) => sum + (item.price * item.qty), 0)
+    try {
+      // 1. ดึงข้อมูลสต็อกและราคาปัจจุบันจาก Supabase
+      const { data: currentProduct, error: fetchError } = await supabase
+        .from('products')
+        .select('id, name, price, stock')
+        .eq('id', product.id)
+        .single()
 
-  async function handleCheckout() {
-    if (cart.length === 0) return
-
-    for (const item of cart) {
-      // 1. ตรวจสอบสต๊อกล่าสุดก่อนขาย
-      const { data: p } = await supabase.from('products').select('stock').eq('id', item.id).single()
-      if (!p || p.stock < item.qty) {
-        alert(`สินค้า ${item.name} มีสต๊อกไม่พอในการขาย`)
-        return
+      if (fetchError || !currentProduct) {
+        throw new Error('ไม่พบข้อมูลสินค้าในระบบ')
       }
 
-      // 2. ลงตาราง sales
-      await supabase.from('sales').insert([{
-        product_id: item.id,
-        product_name: item.name,
-        quantity: item.qty,
-        total_price: item.price * item.qty
-      }])
+      if (currentProduct.stock < quantity) {
+        throw new Error(`สินค้าในสต็อกไม่พอ (คงเหลือ ${currentProduct.stock} ชิ้น)`)
+      }
 
-      // 3. ตัดสต๊อก
-      await supabase.from('products').update({
-        stock: p.stock - item.qty
-      }).eq('id', item.id)
+      // 2. คำนวณสต็อกหลังตัด และ ราคารวม
+      const updatedStock = currentProduct.stock - quantity
+      const totalPrice = currentProduct.price * quantity
+
+      // 3. อัปเดตสต็อกสินค้าใหม่ใน Supabase
+      const { error: updateError } = await supabase
+        .from('products')
+        .update({ stock: updatedStock })
+        .eq('id', product.id)
+
+      if (updateError) throw updateError
+
+      // 4. บันทึกประวัติการขาย (ถ้ามีตาราง sales)
+      await supabase.from('sales').insert([
+        {
+          product_id: product.id,
+          quantity: quantity,
+          total_price: totalPrice,
+        },
+      ])
+
+      // ==========================================
+      // 5. ระบบแจ้งเตือน Telegram (Async Background Tasks)
+      // ==========================================
+      
+      // งานที่ 1: แจ้งเตือน Order เข้า (New Order Alert)
+      const orderMessage = 
+        `🛍️ <b>มีรายการขายใหม่!</b>\n` +
+        `- สินค้า: ${currentProduct.name}\n` +
+        `- จำนวน: ${quantity} ชิ้น\n` +
+        `- ราคารวม: ${totalPrice.toLocaleString()} บาท\n` +
+        `- สต็อกคงเหลือปัจจุบัน: ${updatedStock} ชิ้น\n` +
+        `- เวลา: ${new Date().toLocaleString('th-TH')}`
+
+      await sendTelegramMessage(orderMessage)
+
+      // งานที่ 2: แจ้งเตือน Stock เหลือน้อย (Low Stock Alert: Stock <= 5)
+      if (updatedStock <= 5) {
+        const lowStockMessage = 
+          `🚨 <b>[เตือนภัย] สต็อกสินค้าใกล้หมด!</b>\n` +
+          `- สินค้า: ${currentProduct.name}\n` +
+          `- คงเหลือเพียง: ${updatedStock} ชิ้น\n` +
+          `⚠️ กรุณาเติมสต็อกสินค้าด่วน!`
+
+        await sendTelegramMessage(lowStockMessage)
+      }
+
+      alert('ชำระเงินและตัดสต็อกสำเร็จเรียบร้อย!')
+
+    } catch (err) {
+      alert(`เกิดข้อผิดพลาด: ${err.message}`)
+    } finally {
+      setLoading(false)
     }
-
-    alert('✅ ยืนยันการขายสำเร็จ!')
-    setCart([])
-    fetchProducts()
   }
 
   return (
-    <div>
-      <h1>🛒 หน้าขายสินค้า</h1>
-
-      <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr', gap: '20px' }}>
-        <div>
-          <div className="card">
-            <h3>เลือกสินค้า</h3>
-            <div style={{ display: 'flex', gap: '10px', marginTop: '10px' }}>
-              <select value={selectedProductId} onChange={e => setSelectedProductId(e.target.value)}>
-                <option value="">-- เลือกรายการสินค้า --</option>
-                {products.map(p => (
-                  <option key={p.id} value={p.id} disabled={p.stock <= 0}>
-                    {p.name} ({p.price} ฿) - คงเหลือ {p.stock} {p.unit}
-                  </option>
-                ))}
-              </select>
-              <input type="number" min="1" style={{ width: '80px' }} value={quantity} onChange={e => setQuantity(e.target.value)} />
-              <button className="btn-primary" style={{ whiteSpace: 'nowrap' }} onClick={addToCart}>+ เพิ่มเข้าตะกร้า</button>
-            </div>
-          </div>
-
-          <div className="card">
-            <h3>รายการในตะกร้า</h3>
-            <table>
-              <thead>
-                <tr>
-                  <th>สินค้า</th>
-                  <th>ราคา</th>
-                  <th>จำนวน</th>
-                  <th>รวม</th>
-                  <th>จัดการ</th>
-                </tr>
-              </thead>
-              <tbody>
-                {cart.map(item => (
-                  <tr key={item.id}>
-                    <td>{item.name}</td>
-                    <td>{item.price} ฿</td>
-                    <td>{item.qty}</td>
-                    <td>{item.price * item.qty} ฿</td>
-                    <td><button className="btn-danger" onClick={() => removeFromCart(item.id)}>ลบ</button></td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </div>
-
-        <div>
-          <div className="card" style={{ textAlign: 'center', background: '#eff6ff', border: '2px solid #bfdbfe' }}>
-            <h2>ยอดขายรวมทั้งหมด</h2>
-            <h1 style={{ fontSize: '48px', color: '#2563eb', margin: '15px 0' }}>{grandTotal.toLocaleString()} ฿</h1>
-            <button className="btn-primary" style={{ width: '100%', padding: '15px', fontSize: '18px' }} onClick={handleCheckout} disabled={cart.length === 0}>
-              ✅ ยืนยันการขาย
-            </button>
-          </div>
-        </div>
-      </div>
+    <div style={{ padding: '20px' }}>
+      <h1>หน้าขายสินค้า (POS)</h1>
+      {/* ส่วน UI แสดงรายการสินค้า / ปุ่มกดขายสินค้า */}
     </div>
   )
 }
